@@ -13,6 +13,13 @@ const root = path.resolve(__dirname, "..");
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
+const modelFallback = process.env.OPENAI_MODEL || "gpt-5.6-luna";
+const allowedModels = new Set([
+  "gpt-5.6-luna",
+  "gpt-5.6-terra",
+  "gpt-5.6-sol"
+]);
+
 const client = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
@@ -21,7 +28,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     aiConfigured: Boolean(client),
-    model: process.env.OPENAI_MODEL || "gpt-5.6-luna"
+    model: modelFallback
   });
 });
 
@@ -34,18 +41,27 @@ app.post("/api/chat", async (req, res) => {
 
   const body = req.body ?? {};
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const model = typeof body.model === "string" && body.model.trim()
-    ? body.model.trim()
-    : process.env.OPENAI_MODEL || "gpt-5.6-luna";
+  const requestedModel =
+    typeof body.model === "string" && body.model.trim()
+      ? body.model.trim()
+      : modelFallback;
+  const model = allowedModels.has(requestedModel) ? requestedModel : modelFallback;
 
   if (messages.length === 0) {
     return res.status(400).json({ error: "At least one message is required." });
   }
 
-  const sanitized = messages.slice(-40).map((message) => ({
-    role: message?.role === "assistant" ? "assistant" : "user",
-    content: String(message?.content || "").slice(0, 20000)
-  }));
+  const sanitized = messages
+    .slice(-40)
+    .map((message) => ({
+      role: message?.role === "assistant" ? "assistant" : "user",
+      content: String(message?.content || "").slice(0, 20000)
+    }))
+    .filter((message) => message.content.trim().length > 0);
+
+  if (sanitized.length === 0) {
+    return res.status(400).json({ error: "Message content cannot be empty." });
+  }
 
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -54,7 +70,13 @@ app.post("/api/chat", async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
 
-  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  const send = (payload) => {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+  };
+
+  let completed = false;
 
   try {
     const stream = await client.responses.create({
@@ -68,23 +90,42 @@ app.post("/api/chat", async (req, res) => {
     for await (const event of stream) {
       if (event.type === "response.output_text.delta") {
         send({ type: "delta", text: event.delta });
+      } else if (event.type === "response.completed") {
+        completed = true;
       } else if (event.type === "response.failed") {
-        const message = event.response?.error?.message || "The model request failed.";
+        const message =
+          event.response?.error?.message || "The model request failed.";
         send({ type: "error", message });
+        break;
+      } else if (event.type === "error") {
+        send({
+          type: "error",
+          message: event.message || "The streaming request failed."
+        });
         break;
       }
     }
 
-    send({ type: "done" });
-    res.write("data: [DONE]\n\n");
+    if (!completed) {
+      send({
+        type: "error",
+        message: "The model stream ended before completion."
+      });
+    } else {
+      send({ type: "done" });
+    }
+
+    send("[DONE]");
     res.end();
   } catch (error) {
     console.error("Orbit AI request failed:", error);
+
     send({
       type: "error",
-      message: error instanceof Error ? error.message : "Unexpected AI server error."
+      message:
+        error instanceof Error ? error.message : "Unexpected AI server error."
     });
-    res.write("data: [DONE]\n\n");
+    send("[DONE]");
     res.end();
   }
 });
