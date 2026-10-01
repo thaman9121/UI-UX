@@ -76,6 +76,13 @@ app.post("/api/chat", async (req, res) => {
     }
   };
 
+  const finish = () => {
+    if (!res.writableEnded) {
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  };
+
   let completed = false;
 
   try {
@@ -93,9 +100,11 @@ app.post("/api/chat", async (req, res) => {
       } else if (event.type === "response.completed") {
         completed = true;
       } else if (event.type === "response.failed") {
-        const message =
-          event.response?.error?.message || "The model request failed.";
-        send({ type: "error", message });
+        send({
+          type: "error",
+          message:
+            event.response?.error?.message || "The model request failed."
+        });
         break;
       } else if (event.type === "error") {
         send({
@@ -115,8 +124,7 @@ app.post("/api/chat", async (req, res) => {
       send({ type: "done" });
     }
 
-    send("[DONE]");
-    res.end();
+    finish();
   } catch (error) {
     console.error("Orbit AI request failed:", error);
 
@@ -125,8 +133,7 @@ app.post("/api/chat", async (req, res) => {
       message:
         error instanceof Error ? error.message : "Unexpected AI server error."
     });
-    send("[DONE]");
-    res.end();
+    finish();
   }
 });
 
